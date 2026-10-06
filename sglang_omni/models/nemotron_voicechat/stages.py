@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 from pathlib import Path
 
 import torch
-from einops import rearrange
 from torch import nn
 from transformers import AutoTokenizer
 
@@ -12,6 +13,7 @@ from sglang_omni.models.nemotron_voicechat.code2wav_stream import (
     NemotronCode2WavScheduler,
 )
 from sglang_omni.models.nemotron_voicechat.codec import RVQVAEDecoder
+from sglang_omni.models.nemotron_voicechat.config import default_perception_factory_args
 from sglang_omni.models.nemotron_voicechat.conformer import (
     AudioPerception,
     GraphPerception,
@@ -25,6 +27,10 @@ from sglang_omni.models.nemotron_voicechat.payload_types import (
     OUTPUT_SAMPLE_RATE,
     NemotronVoiceChatState,
 )
+from sglang_omni.models.nemotron_voicechat.perception_scheduler import (
+    PerceptionEncoder,
+    PerceptionScheduler,
+)
 from sglang_omni.models.weight_loader import (
     load_module,
     load_weights_by_prefix,
@@ -37,6 +43,8 @@ from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.utils.audio import load_audio
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 from sglang_omni.utils.device import resolve_concrete_device
+
+logger = logging.getLogger(__name__)
 
 PERCEPTION_PREFIX = "stt_model.perception."
 SAMPLES_PER_FRAME = 1_280
@@ -84,7 +92,49 @@ def create_perception_executor(
     device: str | None = None,
     gpu_id: int | None = None,
     enable_cuda_graph: bool = True,
-) -> SimpleScheduler[StagePayload, StagePayload]:
+    max_batch_size: int | None = None,
+    max_batch_wait_ms: float | None = None,
+    max_batch_frames: int | None = None,
+    max_padding_ratio: float | None = None,
+) -> PerceptionScheduler:
+    defaults = default_perception_factory_args()
+    max_batch_size = (
+        defaults.max_batch_size if max_batch_size is None else max_batch_size
+    )
+    max_batch_wait_ms = (
+        defaults.max_batch_wait_ms if max_batch_wait_ms is None else max_batch_wait_ms
+    )
+    max_batch_frames = (
+        defaults.max_batch_frames if max_batch_frames is None else max_batch_frames
+    )
+    max_padding_ratio = (
+        defaults.max_padding_ratio if max_padding_ratio is None else max_padding_ratio
+    )
+    for name, value in (
+        ("max_batch_size", max_batch_size),
+        ("max_batch_frames", max_batch_frames),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+        else:
+            pass
+    for name, value, minimum in (
+        ("max_batch_wait_ms", max_batch_wait_ms, 0.0),
+        ("max_padding_ratio", max_padding_ratio, 1.0),
+    ):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < minimum
+        ):
+            raise ValueError(f"{name} must be a finite number >= {minimum}")
+        else:
+            pass
+    if not isinstance(enable_cuda_graph, bool):
+        raise ValueError("enable_cuda_graph must be a boolean")
+    else:
+        pass
     device = resolve_concrete_device(device, gpu_id)
     module = AudioPerception(perception_config(model_path))
     load_module(
@@ -96,33 +146,23 @@ def create_perception_executor(
         strict=True,
     )
     module.eval()
-    parameter_dtype = module.proj.weight.dtype
+    if max_batch_size > 1 and module.proj.weight.dtype != torch.float32:
+        logger.warning(
+            f"Perception batching requires float32; preserving {module.proj.weight.dtype} and using effective batch size 1"
+        )
+        max_batch_size = 1
+    else:
+        pass
     perception_stream = (
         GraphPerception(module) if enable_cuda_graph else StreamingPerception(module)
     )
-
-    @torch.inference_mode()
-    def encode(payload: StagePayload) -> StagePayload:
-        state = NemotronVoiceChatState.from_dict(payload.data)
-        waveform = state.waveform
-        waveform_1S = (
-            rearrange(waveform, "s -> 1 s") if waveform.ndim == 1 else waveform
-        )
-
-        frames = module(
-            waveform_1S.to(device=device, dtype=parameter_dtype),
-            stream=perception_stream,
-        )
-        assert frames.shape[1] == state.num_frames + 1, (
-            f"Perception returned {frames.shape[1]} rows for {state.num_frames} "
-            "frames of audio; expected one more than the frame count."
-        )
-
-        state.acoustic_frames = frames[0]
-        payload.data = state.to_dict()
-        return payload
-
-    return SimpleScheduler(encode)
+    return PerceptionScheduler(
+        PerceptionEncoder(module, perception_stream, enable_cuda_graph),
+        max_batch_size=max_batch_size,
+        max_batch_wait_ms=max_batch_wait_ms,
+        max_batch_frames=max_batch_frames,
+        max_padding_ratio=max_padding_ratio,
+    )
 
 
 def create_thinker_executor(

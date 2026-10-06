@@ -29,7 +29,7 @@ def execution_device(request: pytest.FixtureRequest) -> torch.device:
     return torch.device(request.param)
 
 
-@pytest.fixture(params=[0, 2, 7])
+@pytest.fixture(params=[0, 2, 7, 70])
 def perception_model(
     request: pytest.FixtureRequest, execution_device: torch.device
 ) -> AudioPerception:

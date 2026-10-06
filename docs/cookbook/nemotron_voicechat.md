@@ -40,6 +40,67 @@ Two input conventions matter:
 
 The reply text is the thinker's spoken tokens only; frames where the model is listening carry a marker token and are dropped from the text.
 
+## Offline Perception batching
+
+Cross-request Perception encoding is opt-in. The default remains
+`max_batch_size=1`; set it back to 1 to restore singleton admission and
+the existing singleton encoder. Configure the Perception stage through the
+existing dotted factory options, for example:
+
+```bash
+--perception.factory.max_batch_size 4 \
+--perception.factory.max_batch_wait_ms 0.0 \
+--perception.factory.max_batch_frames 4096 \
+--perception.factory.max_padding_ratio 1.25
+```
+
+These options also work in the stage's YAML `factory` mapping or as
+keyword arguments to `create_perception_executor`. Batch size and frame
+budget must be positive integers; wait must be finite and nonnegative;
+padding ratio must be finite and at least 1. The frame budget counts padded
+80 ms steps, including each request's final flush. Oversized recordings
+retain their singleton path rather than gaining a new duration limit.
+
+Cohorts anchor the oldest queued request and admit lengths from the same
+power-of-two bucket. Nearby lengths on opposite sides of a bucket boundary
+can therefore run separately. Bounded lookahead preserves deferred FIFO
+order. A positive wait starts only after a compatible second request joins;
+a lone request never waits to fill its batch. The default wait is zero.
+
+Batching supports the checkpoint's default float32 precision. A selected
+non-float32 dtype is preserved and explicitly falls back to effective batch
+size 1 with a warning. `enable_cuda_graph=false` selects eager execution;
+CPU execution is eager. Each executor retains its singleton stream and at
+most one exact-size batched runner, so changing cohort size may recapture
+the CUDA graph. Perception batching does not change the thinker or talker's
+singleton limits, or the native realtime scheduling path.
+
+On one B200 with the official checkpoint, float32 weights and CUDA Graphs,
+a trial with `max_batch_size=8` and the other options above produced the
+following Perception-stage throughput changes against the original
+graph-enabled singleton. Each case used five measured rounds after warmup,
+with singleton controls before and after the candidate runs.
+
+| Concurrent requests | 7-frame audio | 72-frame audio | 512-frame audio |
+|---|---|---|---|
+| 4 | +75.7% | +12.8% | +27.7% |
+| 8 | +147.1% | +92.8% | +130.9% |
+
+At concurrency 1, throughput changed by less than 0.5%. In a separate
+identical arrival trace with 240 short requests per concurrency, short-request
+p95 latency fell from about 117 ms to 54 ms at concurrency 4 and from 234 ms
+to 66 ms at concurrency 8. These are stage measurements, not end-to-end
+speech throughput gains: the thinker and talker still admit one running
+request each.
+
+Results depend on length compatibility and graph reuse. Mixed-length cases
+at concurrency 4 and 8 gained less than 1%; one sparse-arrival case at
+concurrency 8 lost 8.1% throughput as cohort sizes changed and graphs were
+recaptured. Eager execution remained correct but was slower than the
+graph-enabled singleton at low concurrency. Keep the default at 1, and
+measure the actual arrival pattern, capture churn, and allocated and reserved
+memory before enabling batching in a deployment.
+
 ## Realtime conversation
 
 ```bash
@@ -65,7 +126,7 @@ Audio randomness is governed by the checkpoint's own settings, read from `config
 
 ## Known limitations
 
-- The offline pipeline handles one request at a time (`max_running_requests=1` for both engines), without a barge-in or interrupt API.
+- The thinker and talker each handle one running request at a time (`max_running_requests=1`), even when offline Perception batching is enabled; the offline API has no barge-in interface.
 - Single speaker (`Aria`, the checkpoint's baked-in prompt latents).
 - The `function_head` tool-call channel is decoded and carried through but nothing acts on it.
 - Classifier-free guidance is off (`guidance_scale=0`) although the checkpoint config enables it at 0.2.

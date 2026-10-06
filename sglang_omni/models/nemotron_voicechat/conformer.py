@@ -219,7 +219,11 @@ class AudioPerception(nn.Module):
             stream = StreamingPerception(self)
         else:
             stream.reset()
-        rows = [stream.push(block) for block in waveform_BL[0].split(SAMPLES_PER_FRAME)]
+        rows = [
+            stream.push(block)
+            for block in waveform_BL[0].split(SAMPLES_PER_FRAME)
+            if block.numel() != 0
+        ]
         rows.append(stream.flush())
         return torch.cat(rows).unsqueeze(0)
 
@@ -232,7 +236,8 @@ class StreamingPerception:
     plus the preemphasis carry, so each push touches one frame of compute.
     """
 
-    def __init__(self, perception: AudioPerception) -> None:
+    def __init__(self, perception: AudioPerception, *, batch_size: int = 1) -> None:
+        self.batch_size = batch_size
         self.perception = perception
         parameter = perception.proj.weight
         self.device = parameter.device
@@ -277,16 +282,28 @@ class StreamingPerception:
                 for layer in encoder.layers
             ]
 
-        self.preemphasis_carry = torch.empty(1, device=self.device, dtype=self.dtype)
+        self.preemphasis_carry = torch.empty(
+            (1,) if batch_size == 1 else (batch_size, 1),
+            device=self.device,
+            dtype=self.dtype,
+        )
         self.sample_buffer = torch.empty(
-            preprocessor.left_padding, device=self.device, dtype=self.dtype
+            (
+                (preprocessor.left_padding,)
+                if batch_size == 1
+                else (batch_size, preprocessor.left_padding)
+            ),
+            device=self.device,
+            dtype=self.dtype,
         )
 
         num_mels = preprocessor.featurizer.fb.shape[1]
         sub_cache_shapes: list[tuple[int, int, int, int]] = []
         channels, freqs = 1, num_mels
         for conv, _ in self.sub_stages:
-            sub_cache_shapes.append((1, channels, SUBSAMPLING_CACHE_SIZE, freqs))
+            sub_cache_shapes.append(
+                (batch_size, channels, SUBSAMPLING_CACHE_SIZE, freqs)
+            )
             channels = conv.out_channels
             freqs = freqs // SUBSAMPLING_STRIDE + 1
         self.sub_caches = [
@@ -297,9 +314,11 @@ class StreamingPerception:
         layers = perception.encoder.layers
         self.key_caches = [
             torch.empty(
-                self.max_keys,
-                self.num_heads,
-                self.head_size,
+                (
+                    (self.max_keys, self.num_heads, self.head_size)
+                    if batch_size == 1
+                    else (batch_size, self.max_keys, self.num_heads, self.head_size)
+                ),
                 device=self.device,
                 dtype=self.dtype,
             )
@@ -308,7 +327,7 @@ class StreamingPerception:
         self.value_caches = [torch.empty_like(keys) for keys in self.key_caches]
         self.conv_caches = [
             torch.empty(
-                1,
+                batch_size,
                 layer.conv.depthwise_conv.in_channels,
                 layer.conv.depthwise_conv.left_padding,
                 device=self.device,
@@ -316,7 +335,11 @@ class StreamingPerception:
             )
             for layer in layers
         ]
-        self.cached_frame_count = torch.empty((), device=self.device, dtype=torch.long)
+        self.cached_frame_count = torch.empty(
+            () if batch_size == 1 else (batch_size,),
+            device=self.device,
+            dtype=torch.long,
+        )
         self.key_positions_K = torch.arange(self.max_keys, device=self.device)
         self.reset()
 
@@ -362,11 +385,15 @@ class StreamingPerception:
         previous_S = torch.cat((self.preemphasis_carry, samples_S[:-1]))
         preemphasized_S = samples_S - DEFAULT_PREEMPHASIS * previous_S
         window_W = torch.cat((self.sample_buffer, preemphasized_S))
-        self.sample_buffer.copy_(window_W[-preprocessor.left_padding :])
-        self.preemphasis_carry.copy_(samples_S[-1:])
+        self.write_state(self.sample_buffer, window_W[-preprocessor.left_padding :])
+        self.write_state(self.preemphasis_carry, samples_S[-1:])
 
+        return self.log_mel_features(window_W)
+
+    def log_mel_features(self, window_samples: torch.Tensor) -> torch.Tensor:
+        preprocessor = self.perception.preprocessor
         spectrum_FT = torch.stft(
-            rearrange(window_W, "w -> 1 w"),
+            rearrange(window_samples, "w -> 1 w"),
             n_fft=preprocessor.n_fft,
             hop_length=preprocessor.hop_length,
             win_length=preprocessor.win_length,
@@ -379,7 +406,16 @@ class StreamingPerception:
         log_mel_MT = torch.log(mel_MT + DEFAULT_LOG_ZERO_GUARD)
         return rearrange(log_mel_MT, "m t -> 1 t m")
 
+    def write_state(self, buffer: torch.Tensor, candidate: torch.Tensor) -> None:
+        buffer.copy_(candidate)
+
+    def advance_frame_count(self) -> None:
+        self.cached_frame_count.add_(1).clamp_(max=self.max_keys)
+
     def encode(self, mel_1TM: torch.Tensor) -> torch.Tensor:
+        return self.encode_step(mel_1TM)[0]
+
+    def encode_step(self, mel_1TM: torch.Tensor) -> torch.Tensor:
         hidden_11D = self.subsample(mel_1TM) * self.xscale
         for index, layer in enumerate(self.perception.encoder.layers):
             hidden_11D = hidden_11D + FEED_FORWARD_RESIDUAL_SCALE * layer.feed_forward1(
@@ -395,20 +431,22 @@ class StreamingPerception:
                 layer.norm_feed_forward2(hidden_11D)
             )
             hidden_11D = layer.norm_out(hidden_11D)
-        self.cached_frame_count.add_(1).clamp_(max=self.max_keys)
-        return self.perception.proj(hidden_11D)[0]
+        self.advance_frame_count()
+        return self.perception.proj(hidden_11D)
 
     def subsample(self, mel_1TM: torch.Tensor) -> torch.Tensor:
         hidden_1CTM = rearrange(mel_1TM, "b t m -> b 1 t m")
         for stage, (conv, pointwise) in enumerate(self.sub_stages):
             hidden_1CTM = torch.cat((self.sub_caches[stage], hidden_1CTM), dim=2)
-            self.sub_caches[stage].copy_(hidden_1CTM[:, :, -SUBSAMPLING_CACHE_SIZE:])
+            self.write_state(
+                self.sub_caches[stage], hidden_1CTM[:, :, -SUBSAMPLING_CACHE_SIZE:]
+            )
             # The cache stands in for the module's causal time padding; only
             # the frequency axis still pads here.
             padded_1CTM = nn.functional.pad(hidden_1CTM, (*conv.causal_padding, 0, 0))
             hidden_1CTM = nn.Conv2d.forward(conv, padded_1CTM)
             if pointwise is not None:
-                hidden_1CTM = pointwise(hidden_1CTM)
+                hidden_1CTM = self.pointwise_convolve(pointwise, hidden_1CTM)
             else:
                 pass
             hidden_1CTM = torch.relu(hidden_1CTM)
@@ -433,8 +471,8 @@ class StreamingPerception:
         )
         keys_KHS = torch.cat((self.key_caches[index], key_HS[None]))[1:]
         values_KHS = torch.cat((self.value_caches[index], value_HS[None]))[1:]
-        self.key_caches[index].copy_(keys_KHS)
-        self.value_caches[index].copy_(values_KHS)
+        self.write_state(self.key_caches[index], keys_KHS)
+        self.write_state(self.value_caches[index], values_KHS)
         content_KH = einsum(
             query_HS + attention.pos_bias_u, keys_KHS, "h s, k h s -> k h"
         )
@@ -450,17 +488,24 @@ class StreamingPerception:
         attended_HS = einsum(weights_KH, values_KHS, "k h, k h s -> h s")
         return attention.linear_out(rearrange(attended_HS, "h s -> 1 1 (h s)"))
 
+    def pointwise_convolve(
+        self, conv: nn.Conv1d | nn.Conv2d, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        return conv(hidden_states)
+
     def convolve(
         self, index: int, conv: ConformerConvolution, hidden_11D: torch.Tensor
     ) -> torch.Tensor:
-        gates_1Gt = conv.pointwise_conv1(rearrange(hidden_11D, "b t d -> b d t"))
+        gates_1Gt = self.pointwise_convolve(
+            conv.pointwise_conv1, rearrange(hidden_11D, "b t d -> b d t")
+        )
         hidden_1Dt = nn.functional.glu(gates_1Gt, dim=1)
         window_1DT = torch.cat((self.conv_caches[index], hidden_1Dt), dim=2)
-        self.conv_caches[index].copy_(window_1DT[:, :, 1:])
+        self.write_state(self.conv_caches[index], window_1DT[:, :, 1:])
         hidden_1Dt = nn.Conv1d.forward(conv.depthwise_conv, window_1DT)
         hidden_11D = conv.batch_norm(rearrange(hidden_1Dt, "b d t -> b t d"))
         hidden_1Dt = conv.activation(rearrange(hidden_11D, "b t d -> b d t"))
-        hidden_1Dt = conv.pointwise_conv2(hidden_1Dt)
+        hidden_1Dt = self.pointwise_convolve(conv.pointwise_conv2, hidden_1Dt)
         return rearrange(hidden_1Dt, "b d t -> b t d")
 
 
