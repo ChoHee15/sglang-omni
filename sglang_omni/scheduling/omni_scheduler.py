@@ -51,7 +51,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_model, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.session.session_controller import SessionController
-from sglang.srt.utils import broadcast_pyobj
+from sglang.srt.utils import DynamicGradMode, broadcast_pyobj
 from typing_extensions import TypedDict
 
 from sglang_omni.admission import ContextExhaustedError, QueueFullError
@@ -60,6 +60,7 @@ from sglang_omni.model_runner.mlx_model_worker import MlxSchedulerPendingStep
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.weight_checker import WeightCheckResult
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.platforms import current_platform
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import (
     emit_model_path_end as _emit_model_path_end,
@@ -3038,11 +3039,7 @@ class OmniScheduler(Generic[RequestDataT]):
 
     @staticmethod
     def empty_torch_cache() -> None:
-        if not torch.cuda.is_available():
-            return
-        else:
-            pass
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def mark_running_request_aborted(self, request_id: str) -> bool:
         marked = False
@@ -3148,6 +3145,8 @@ class OmniScheduler(Generic[RequestDataT]):
             pass
         release_kv_cache(req, self.tree_cache)
 
+    # note (0xtoward): with autograd on, writes to reused buffers leak every step.
+    @DynamicGradMode()
     def event_loop_normal(self) -> None:
         # Note (Chenyang): yield the GIL when idle so co-located non-AR stages
         # (encoders, preprocessor) running in sibling threads aren't starved
@@ -3457,6 +3456,7 @@ class OmniScheduler(Generic[RequestDataT]):
             pass
         return batch if batch.reqs else None
 
+    @DynamicGradMode()
     def event_loop_async_decode(self) -> None:
         """One-step-lookahead decode loop (single stream + CUDA event).
 

@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import ClassVar
 
+import msgpack
 import numpy as np
 import pytest
 import torch
@@ -26,6 +27,8 @@ from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
     FunCosyVoice3StreamingVocoderScheduler,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.platforms.cuda import CUDAOmniPlatform
+from sglang_omni.platforms.xpu import XPUOmniPlatform
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
 from tests.unit_test.fun_cosyvoice3.test_flow_batch import FakeFlow as _PackedFlow
@@ -452,13 +455,19 @@ def test_cosyvoice3_token2wav_chunk_slices_mel_and_hift_delta() -> None:
     assert tail.shape[-1] == 6 * 480
 
 
-def test_cosyvoice3_vocoder_prepare_and_store_audio_payload() -> None:
+@pytest.mark.parametrize("strided", [False, True])
+def test_cosyvoice3_vocoder_prepare_and_store_audio_payload(strided: bool) -> None:
+    """Completion preserves audio and reference features over MessagePack."""
     vocoder = stages.CosyVoice3Vocoder(BatchCapableFakeFlow(), FakeHiFT())
+    reference_features = torch.arange(640, dtype=torch.float32).reshape(1, 8, 80)
+    if strided:
+        reference_features = reference_features[:, ::2, :]
     state = FunCosyVoice3State(
         text="hello",
         audio_codes=torch.tensor([[1, 2], [3, 4]]),
         flow_prompt_speech_token=torch.tensor([[5]], dtype=torch.int32),
         flow_embedding=torch.ones(1, 192),
+        flow_prompt_speech_feat=reference_features,
     )
     payload = make_payload(state)
 
@@ -474,6 +483,19 @@ def test_cosyvoice3_vocoder_prepare_and_store_audio_payload() -> None:
     assert stored.data["sample_rate"] == 24000
     assert stored.data["modality"] == "audio"
     assert "audio_codes" not in stored.data
+    completion = msgpack.unpackb(
+        msgpack.packb(stored.data, use_bin_type=True), raw=False
+    )
+    decoded_state = FunCosyVoice3State.from_dict(completion)
+    torch.testing.assert_close(
+        decoded_state.flow_prompt_speech_feat, reference_features, rtol=0, atol=0
+    )
+    result = Client.default_result_builder(stored.request_id, completion)
+    np.testing.assert_array_equal(
+        result.audio_data, np.array([0.1, 0.2], dtype=np.float32)
+    )
+    assert result.sample_rate == 24000
+    assert result.modality == "audio"
 
 
 def test_cosyvoice3_vocoder_rejects_payload_without_audio_codes() -> None:
@@ -484,19 +506,32 @@ def test_cosyvoice3_vocoder_rejects_payload_without_audio_codes() -> None:
         vocoder.prepare_item(payload)
 
 
-def test_mlx_vocoder_audio_payload_survives_state_storage() -> None:
+@pytest.mark.parametrize("strided", [False, True])
+def test_mlx_vocoder_audio_payload_survives_state_storage(strided: bool) -> None:
+    """The MLX completion adapter also serializes reference features and usage."""
+    reference_features = torch.arange(640, dtype=torch.float32).reshape(1, 8, 80)
+    if strided:
+        reference_features = reference_features[:, ::2, :]
     state = FunCosyVoice3State(
         text="hello",
         audio_codes=torch.tensor([[1], [2]]),
         audio_samples=[9.0],
         prompt_tokens=3,
         completion_tokens=2,
+        flow_prompt_speech_feat=reference_features,
     )
     waveform = np.array([[0.1, -0.2]], dtype=np.float32)
 
     mlx_vocoder = object.__new__(stages.CosyVoice3MlxVocoderAdapter)
     stored = mlx_vocoder.store_result(make_payload(state), state, waveform, 24000)
-    result = Client.default_result_builder(stored.request_id, stored.data)
+    completion = msgpack.unpackb(
+        msgpack.packb(stored.data, use_bin_type=True), raw=False
+    )
+    decoded_state = FunCosyVoice3State.from_dict(completion)
+    torch.testing.assert_close(
+        decoded_state.flow_prompt_speech_feat, reference_features, rtol=0, atol=0
+    )
+    result = Client.default_result_builder(stored.request_id, completion)
 
     np.testing.assert_array_equal(result.audio_data, waveform.reshape(-1))
     assert result.sample_rate == 24000
@@ -1131,13 +1166,14 @@ def prepare_vocoder_startup(
         "warmup_packed_dit_compile",
         lambda scheduler: startup_events.append("packed_warmup"),
     )
-    if device_type == "cuda":
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    if device_type in ("cuda", "xpu"):
+        platform = CUDAOmniPlatform() if device_type == "cuda" else XPUOmniPlatform()
+        monkeypatch.setattr(stages, "current_platform", platform)
 
         class RecordingFlowCudaGraphRunner:
             def __init__(self, flow, *, device, autocast_dtype) -> None:
                 assert flow is fake_flow
-                assert device.type == "cuda"
+                assert device.type == device_type
                 assert autocast_dtype == torch.bfloat16
                 startup_events.append("runner_create")
 
@@ -1182,6 +1218,32 @@ def test_create_vocoder_executor_compiles_before_flow_graph_capture(
     else:
         assert "native_compile" not in startup_events
     assert ("packed_warmup" in startup_events) is enable_dit_torch_compile
+
+
+@pytest.mark.parametrize("enable_dit_torch_compile", [False, True])
+def test_create_vocoder_executor_on_xpu_captures_flow_graphs_only_for_an_eager_dit(
+    monkeypatch: pytest.MonkeyPatch,
+    enable_dit_torch_compile: bool,
+) -> None:
+    startup_events: list[str] = []
+    prepare_vocoder_startup(
+        monkeypatch,
+        startup_events,
+        device_type="xpu",
+        allow_native_compile=enable_dit_torch_compile,
+    )
+
+    stages.create_vocoder_executor(
+        "model",
+        flow_prefix_cache_gb=0.0,
+        enable_flow_prefix_cuda_graph=True,
+        device="xpu",
+        enable_dit_torch_compile=enable_dit_torch_compile,
+        enable_flow_cuda_graph=True,
+        flow_cuda_graph_capture_shapes=FLOW_GRAPH_CAPTURE_SHAPES,
+    )
+
+    assert ("graph_capture" in startup_events) is not enable_dit_torch_compile
 
 
 def test_create_vocoder_executor_trt_without_compile_skips_the_compile(
