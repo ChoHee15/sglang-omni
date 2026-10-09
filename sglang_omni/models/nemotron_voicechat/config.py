@@ -24,6 +24,7 @@ class PerceptionFactoryArgs(FactoryArgs):
     dtype: str | None = MODEL_DTYPE
     enable_cuda_graph: StrictBool | None = None
     max_batch_size: StrictInt | None = Field(default=None, ge=1)
+    max_cached_batch_runners: StrictInt | None = Field(default=None, ge=1)
     max_batch_frames: StrictInt | None = Field(default=None, ge=1)
     max_padding_ratio: float | None = Field(default=None, ge=1, allow_inf_nan=False)
     max_batch_wait_ms: float | None = Field(default=None, ge=0, allow_inf_nan=False)
@@ -47,6 +48,7 @@ def default_perception_factory_args() -> PerceptionFactoryArgs:
     return PerceptionFactoryArgs(
         dtype=MODEL_DTYPE,
         max_batch_size=1,
+        max_cached_batch_runners=1,
         max_batch_wait_ms=0.0,
         max_batch_frames=4096,
         max_padding_ratio=1.25,

@@ -132,10 +132,14 @@ def test_singleton_nonempty_retains_original_graph_exactness(
 @pytest.mark.parametrize("enable_cuda_graph", [False, True])
 @torch.inference_mode()
 def test_attention_context_boundary_and_rollover(
-    perception_model: AudioPerception, enable_cuda_graph: bool,
+    perception_model: AudioPerception,
+    enable_cuda_graph: bool,
 ) -> None:
     device = perception_model.proj.weight.device
-    waveforms = [torch.randn(count * SAMPLES_PER_FRAME, device=device) / 100 for count in (69, 70, 71, 72)]
+    waveforms = [
+        torch.randn(count * SAMPLES_PER_FRAME, device=device) / 100
+        for count in (69, 70, 71, 72)
+    ]
     runner = BatchedPerceptionRunner(perception_model, 4, enable_cuda_graph)
     actual = runner.encode(waveforms)
     for waveform, features in zip(waveforms, actual):
@@ -145,7 +149,8 @@ def test_attention_context_boundary_and_rollover(
 
 @torch.inference_mode()
 def test_known_graph_capture_failure_keeps_fresh_eager_outputs(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     perception_model: AudioPerception,
 ) -> None:
     if perception_model.proj.weight.device.type != "cuda":
@@ -153,13 +158,24 @@ def test_known_graph_capture_failure_keeps_fresh_eager_outputs(
     else:
         pass
     device = perception_model.proj.weight.device
-    waveforms = [torch.randn(count * SAMPLES_PER_FRAME, device=device) / 100 for count in (2, 7)]
-    expected = [reference_features(perception_model, waveform) for waveform in waveforms]
+    waveforms = [
+        torch.randn(count * SAMPLES_PER_FRAME, device=device) / 100 for count in (2, 7)
+    ]
+    expected = [
+        reference_features(perception_model, waveform) for waveform in waveforms
+    ]
     runner = BatchedPerceptionRunner(perception_model, 2, True)
-    monkeypatch.setattr(torch.cuda, "CUDAGraph", Mock(side_effect=RuntimeError("CUDA graph capture not supported")))
+    monkeypatch.setattr(
+        torch.cuda,
+        "CUDAGraph",
+        Mock(side_effect=RuntimeError("CUDA graph capture not supported")),
+    )
     for iteration in range(2):
         actual = runner.encode(waveforms)
         for features, reference in zip(actual, expected):
             torch.testing.assert_close(features, reference, rtol=1e-4, atol=1e-5)
     assert runner.graph_capture_count == 0
-    assert len([record for record in caplog.records if "using eager" in record.message]) == 1
+    assert (
+        len([record for record in caplog.records if "using eager" in record.message])
+        == 1
+    )

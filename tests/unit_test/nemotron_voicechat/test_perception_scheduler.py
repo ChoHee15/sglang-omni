@@ -12,9 +12,11 @@ import torch
 
 from sglang_omni.models.nemotron_voicechat import stages
 from sglang_omni.models.nemotron_voicechat.payload_types import NemotronVoiceChatState
+from sglang_omni.models.nemotron_voicechat.perception_encoder import (
+    ValidatedPerceptionRequest,
+)
 from sglang_omni.models.nemotron_voicechat.perception_scheduler import (
     PerceptionScheduler,
-    ValidatedPerceptionRequest,
 )
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage

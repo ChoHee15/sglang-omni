@@ -6,6 +6,11 @@ import torch
 from einops import einsum, rearrange
 from torch import nn
 
+from sglang_omni.models.nemotron_voicechat.cuda_graph import (
+    CapturedStep,
+    GraphExecutionState,
+    is_fatal_cuda_error,
+)
 from sglang_omni.models.nemotron_voicechat.preprocess import (
     DEFAULT_LOG_ZERO_GUARD,
     DEFAULT_PREEMPHASIS,
@@ -512,37 +517,89 @@ class StreamingPerception:
 class GraphPerception(StreamingPerception):
     def __init__(self, perception: AudioPerception) -> None:
         super().__init__(perception)
-        self.graph: torch.cuda.CUDAGraph | None = None
+        self.graph_execution_state: GraphExecutionState = GraphExecutionState()
+        self.captured_step: CapturedStep | None = None
         self.graph_input: torch.Tensor | None = None
-        self.graph_output: torch.Tensor | None = None
+
+    @property
+    def graph(self) -> torch.cuda.CUDAGraph | None:
+        return None if self.captured_step is None else self.captured_step.graph
+
+    @property
+    def graph_output(self) -> torch.Tensor | None:
+        return None if self.captured_step is None else self.captured_step.output
+
+    def close(self) -> None:
+        if self.captured_step is not None:
+            self.captured_step.close()
+        else:
+            pass
+        if not self.graph_execution_state.is_abandoned:
+            self.graph_input = None
+        else:
+            pass
+
+    def abandon(self) -> None:
+        self.graph_execution_state.is_abandoned = True
+        if self.captured_step is not None:
+            self.captured_step.abandon()
+        else:
+            pass
 
     @torch.inference_mode()
     def push(self, samples: torch.Tensor) -> torch.Tensor:
+        if self.graph_execution_state.is_abandoned:
+            raise RuntimeError("Perception CUDA execution was abandoned")
+        else:
+            pass
         assert not self.flushed
         assert samples.shape == (SAMPLES_PER_FRAME,)
         if self.device.type != "cuda":
             return super().push(samples)
         else:
             pass
-        if self.graph is None:
-            buffers = self.state_buffers()
-            saved_values = [buffer.clone() for buffer in buffers]
-            self.graph_input = samples.to(device=self.device, dtype=self.dtype).clone()
-            capture_stream = torch.cuda.Stream(device=self.device)
-            current_stream = torch.cuda.current_stream(self.device)
-            capture_stream.wait_stream(current_stream)
-            with torch.cuda.stream(capture_stream):
-                for iteration in range(GRAPH_WARMUP_STEPS):
-                    super().push(self.graph_input)
-            current_stream.wait_stream(capture_stream)
-            for buffer, saved_value in zip(buffers, saved_values, strict=True):
-                buffer.copy_(saved_value)
-            self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph, stream=capture_stream):
-                self.graph_output = super().push(self.graph_input)
-        else:
-            pass
-        assert self.graph_input is not None and self.graph_output is not None
-        self.graph_input.copy_(samples)
-        self.graph.replay()
-        return self.graph_output.clone()
+        try:
+            if self.graph is None:
+                buffers = self.state_buffers()
+                saved_values = [buffer.clone() for buffer in buffers]
+                self.graph_input = samples.to(
+                    device=self.device, dtype=self.dtype
+                ).clone()
+                self.captured_step = CapturedStep(
+                    self.device, self.graph_execution_state, allow_pooled_fallback=True
+                )
+                capture_stream = self.captured_step.capture_stream
+                current_stream = torch.cuda.current_stream(self.device)
+                capture_stream.wait_stream(current_stream)
+                with torch.cuda.stream(capture_stream):
+                    for _ in range(GRAPH_WARMUP_STEPS):
+                        super().push(self.graph_input)
+                self.captured_step.wait_for_capture(current_stream)
+                for buffer, saved_value in zip(buffers, saved_values, strict=True):
+                    buffer.copy_(saved_value)
+                self.captured_step.state.graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(
+                    self.captured_step.state.graph, stream=capture_stream
+                ):
+                    self.captured_step.state.output = super().push(self.graph_input)
+            else:
+                pass
+            assert self.graph_input is not None and self.graph_output is not None
+            self.graph_input.copy_(samples)
+            assert self.graph is not None
+            self.graph.replay()
+            return self.graph_output.clone()
+        except Exception as error:
+            if is_fatal_cuda_error(error):
+                self.abandon()
+            elif self.graph is None or self.graph_output is None:
+                if self.captured_step is not None:
+                    self.captured_step.wait_for_capture(
+                        torch.cuda.current_stream(self.device)
+                    )
+                else:
+                    pass
+                self.close()
+            else:
+                pass
+            raise

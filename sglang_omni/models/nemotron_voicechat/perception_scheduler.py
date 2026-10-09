@@ -5,33 +5,17 @@ from __future__ import annotations
 import asyncio
 import queue
 import time
-from dataclasses import dataclass, fields
 from typing import Protocol
 
-import torch
-
-from sglang_omni.models.nemotron_voicechat.batched_perception import (
-    BatchedPerceptionRunner,
-    is_fatal_cuda_error,
+from sglang_omni.models.nemotron_voicechat.cuda_graph import is_fatal_cuda_error
+from sglang_omni.models.nemotron_voicechat.perception_encoder import (
+    ValidatedPerceptionRequest,
 )
-from sglang_omni.models.nemotron_voicechat.conformer import (
-    AudioPerception,
-    StreamingPerception,
-)
-from sglang_omni.models.nemotron_voicechat.payload_types import NemotronVoiceChatState
 from sglang_omni.proto.request import StagePayload
 from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
-SAMPLES_PER_FRAME = 1_280
 SCAN_MULTIPLIER = 4
-
-
-@dataclass(kw_only=True)
-class ValidatedPerceptionRequest:
-    payload: StagePayload
-    state: NemotronVoiceChatState
-    waveform: torch.Tensor
 
 
 class PerceptionCompute(Protocol):
@@ -58,135 +42,6 @@ def message_frame_count(message: IncomingMessage) -> int | None:
             and frame_count >= 0
             else None
         )
-
-
-class PerceptionEncoder:
-    """Own one singleton stream and at most one exact-size batch runner."""
-
-    def __init__(
-        self,
-        model: AudioPerception,
-        stream: StreamingPerception,
-        enable_cuda_graph: bool,
-    ) -> None:
-        self.model = model
-        self.stream = stream
-        self.enable_cuda_graph = enable_cuda_graph
-        self.batch_runner: BatchedPerceptionRunner | None = None
-        self.graph_capture_count = 0
-        self.last_effective_batch_size = 0
-
-    def validate(self, payload: StagePayload) -> ValidatedPerceptionRequest:
-        if not isinstance(payload.data, dict):
-            raise ValueError("Perception payload must be a dictionary")
-        else:
-            pass
-        frame_count = payload.data.get("num_frames")
-        if (
-            not isinstance(frame_count, int)
-            or isinstance(frame_count, bool)
-            or frame_count < 0
-        ):
-            raise ValueError("num_frames must be a nonnegative integer")
-        else:
-            pass
-        state = NemotronVoiceChatState.from_dict(payload.data)
-        waveform = state.waveform
-        if not isinstance(waveform, torch.Tensor) or not waveform.is_floating_point():
-            raise ValueError("Perception waveform must be a floating tensor")
-        elif waveform.ndim == 2 and waveform.shape[0] == 1:
-            waveform = waveform[0]
-        elif waveform.ndim == 1:
-            pass
-        else:
-            raise ValueError(
-                "Perception waveform must have shape [samples] or [1, samples]"
-            )
-        if waveform.numel() != frame_count * SAMPLES_PER_FRAME:
-            raise ValueError(
-                "Perception waveform sample count must equal num_frames * 1280"
-            )
-        else:
-            pass
-        if not torch.isfinite(waveform).all().item():
-            raise ValueError("Perception waveform must contain only finite samples")
-        else:
-            return ValidatedPerceptionRequest(
-                payload=payload, state=state, waveform=waveform
-            )
-
-    @torch.inference_mode()
-    def encode_validated(
-        self, requests: list[ValidatedPerceptionRequest]
-    ) -> list[StagePayload]:
-        self.last_effective_batch_size = len(requests)
-        if len(requests) == 1:
-            request = requests[0]
-            frames = self.model(
-                request.waveform[None].to(
-                    device=self.model.proj.weight.device,
-                    dtype=self.model.proj.weight.dtype,
-                ),
-                stream=self.stream,
-            )
-            outputs = [frames[0]]
-        else:
-            if self.batch_runner is None or self.batch_runner.batch_size != len(
-                requests
-            ):
-                self.batch_runner = None
-                self.batch_runner = BatchedPerceptionRunner(
-                    self.model, len(requests), self.enable_cuda_graph
-                )
-            else:
-                pass
-            previous_capture_count = self.batch_runner.graph_capture_count
-            try:
-                outputs = self.batch_runner.encode(
-                    [request.waveform for request in requests]
-                )
-            finally:
-                if not self.batch_runner.enable_cuda_graph:
-                    self.enable_cuda_graph = False
-                else:
-                    pass
-                self.graph_capture_count += (
-                    self.batch_runner.graph_capture_count - previous_capture_count
-                )
-        if len(outputs) != len(requests):
-            raise ValueError("Perception result count differs from request count")
-        else:
-            pass
-        state_field_names = {field.name for field in fields(NemotronVoiceChatState)}
-        serialized_payloads: list[StagePayload] = []
-        for request, frames in zip(requests, outputs):
-            if frames.ndim != 2 or frames.shape[0] != request.state.num_frames + 1:
-                raise ValueError(
-                    "Perception output must contain num_frames + 1 acoustic rows"
-                )
-            else:
-                pass
-            request.state.acoustic_frames = frames
-            serialized_payloads.append(
-                StagePayload(
-                    request_id=request.payload.request_id,
-                    request=request.payload.request,
-                    data={
-                        **{
-                            name: value
-                            for name, value in request.payload.data.items()
-                            if name not in state_field_names
-                        },
-                        **request.state.to_dict(),
-                    },
-                )
-            )
-        for request, serialized_payload in zip(requests, serialized_payloads):
-            request.payload.data = serialized_payload.data
-        return [request.payload for request in requests]
-
-    def __call__(self, payload: StagePayload) -> StagePayload:
-        return self.encode_validated([self.validate(payload)])[0]
 
 
 class PerceptionScheduler(SimpleScheduler[StagePayload, StagePayload]):

@@ -15,25 +15,17 @@ from sglang_omni.models.nemotron_voicechat.conformer import (
     RelPositionMultiHeadAttention,
     StreamingPerception,
 )
+from sglang_omni.models.nemotron_voicechat.cuda_graph import (
+    CapturedStep,
+    GraphExecutionState,
+    is_fatal_cuda_error,
+)
 from sglang_omni.models.nemotron_voicechat.preprocess import (
     DEFAULT_LOG_ZERO_GUARD,
     DEFAULT_PREEMPHASIS,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def is_fatal_cuda_error(error: Exception) -> bool:
-    """Recognize CUDA errors after which no further device work is safe."""
-    message = str(error).lower()
-    return any(
-        marker in message
-        for marker in (
-            "device-side assert",
-            "illegal memory access",
-            "misaligned address",
-        )
-    )
 
 
 class BatchedStreamingPerception(StreamingPerception):
@@ -166,7 +158,13 @@ class BatchedPerceptionRunner:
     """Own one exact-size eager stream and optional frame CUDA graph."""
 
     def __init__(
-        self, model: AudioPerception, batch_size: int, enable_cuda_graph: bool
+        self,
+        model: AudioPerception,
+        batch_size: int,
+        enable_cuda_graph: bool,
+        graph_execution_state: GraphExecutionState | None = None,
+        *,
+        warmup_steps: int = GRAPH_WARMUP_STEPS,
     ) -> None:
         if (
             isinstance(batch_size, bool)
@@ -176,6 +174,15 @@ class BatchedPerceptionRunner:
             raise ValueError("batch_size must be a positive integer")
         else:
             pass
+        if (
+            isinstance(warmup_steps, bool)
+            or not isinstance(warmup_steps, int)
+            or warmup_steps < 1
+        ):
+            raise ValueError("warmup_steps must be a positive integer")
+        else:
+            pass
+        self.warmup_steps: int = warmup_steps
         self.model = model
         self.batch_size = batch_size
         self.device = model.proj.weight.device
@@ -196,53 +203,117 @@ class BatchedPerceptionRunner:
         self.enable_cuda_graph = (
             enable_cuda_graph and self.device.type == "cuda" and batch_size > 1
         )
-        self.graph: torch.cuda.CUDAGraph | None = None
-        self.graph_output: torch.Tensor | None = None
+        self.graph_execution_state: GraphExecutionState = (
+            GraphExecutionState()
+            if graph_execution_state is None
+            else graph_execution_state
+        )
+        if isinstance(self.stream, GraphPerception):
+            self.stream.graph_execution_state = self.graph_execution_state
+        else:
+            pass
+        self.captured_step: CapturedStep | None = None
         self.graph_capture_count = 0
         self.step_samples = torch.empty(
             batch_size, SAMPLES_PER_FRAME, device=self.device, dtype=self.dtype
         )
 
+    @property
+    def graph(self) -> torch.cuda.CUDAGraph | None:
+        return None if self.captured_step is None else self.captured_step.graph
+
+    @property
+    def graph_output(self) -> torch.Tensor | None:
+        return None if self.captured_step is None else self.captured_step.output
+
+    def close(self) -> None:
+        if self.captured_step is not None:
+            self.captured_step.close()
+        else:
+            pass
+        if isinstance(self.stream, GraphPerception):
+            self.stream.close()
+        else:
+            pass
+
+    def abandon(self) -> None:
+        self.graph_execution_state.is_abandoned = True
+        if self.captured_step is not None:
+            self.captured_step.abandon()
+        else:
+            pass
+
     @torch.inference_mode()
     def capture(self) -> None:
-        assert isinstance(self.stream, BatchedStreamingPerception)
-        self.step_samples.zero_()
-        self.stream.active_rows.fill_(True)
-        capture_stream = torch.cuda.Stream(device=self.device)
-        current_stream = torch.cuda.current_stream(self.device)
-        capture_stream.wait_stream(current_stream)
         try:
-            with torch.cuda.stream(capture_stream):
-                for _ in range(GRAPH_WARMUP_STEPS):
-                    self.stream.push(self.step_samples)
-            current_stream.wait_stream(capture_stream)
-            self.stream.reset()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=capture_stream):
-                output = self.stream.push(self.step_samples)
-        except RuntimeError as error:
+            self.capture_step()
+        except Exception as error:
             if is_fatal_cuda_error(error):
-                raise
-            elif any(
-                marker in str(error).lower()
-                for marker in ("capture", "cuda graph", "not supported", "cufft")
-            ):
-                current_stream.wait_stream(capture_stream)
-                self.stream.reset()
-                self.enable_cuda_graph = False
-                logger.warning(
-                    f"Perception CUDA graph capture unavailable; using eager: {error}"
-                )
+                self.abandon()
             else:
-                raise
-        else:
-            self.graph = graph
-            self.graph_output = output
-            self.graph_capture_count += 1
+                pass
+            raise
+
+    def capture_step(self) -> None:
+        assert isinstance(self.stream, BatchedStreamingPerception)
+        current_stream = torch.cuda.current_stream(self.device)
+        try:
+            self.step_samples.zero_()
+            self.stream.active_rows.fill_(True)
+            self.captured_step = CapturedStep(self.device, self.graph_execution_state)
+            capture_stream = self.captured_step.capture_stream
+            capture_stream.wait_stream(current_stream)
+            with torch.cuda.stream(capture_stream):
+                for _ in range(self.warmup_steps):
+                    self.stream.push(self.step_samples)
+            self.captured_step.wait_for_capture(current_stream)
             self.stream.reset()
+            self.captured_step.state.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(
+                self.captured_step.state.graph, stream=capture_stream
+            ):
+                self.captured_step.state.output = self.stream.push(self.step_samples)
+            self.stream.reset()
+        except Exception as error:
+            if is_fatal_cuda_error(error):
+                self.abandon()
+                raise
+            else:
+                if self.captured_step is not None:
+                    self.captured_step.wait_for_capture(current_stream)
+                    self.close()
+                else:
+                    pass
+                self.stream.reset()
+                if isinstance(error, RuntimeError) and any(
+                    marker in str(error).lower()
+                    for marker in ("capture", "cuda graph", "not supported", "cufft")
+                ):
+                    self.enable_cuda_graph = False
+                    logger.warning(
+                        f"Perception CUDA graph capture unavailable; using eager: {error}"
+                    )
+                else:
+                    raise
+        else:
+            self.graph_capture_count += 1
 
     @torch.inference_mode()
     def encode(self, waveforms: list[torch.Tensor]) -> list[torch.Tensor]:
+        try:
+            return self.encode_waveforms(waveforms)
+        except Exception as error:
+            if is_fatal_cuda_error(error):
+                self.abandon()
+            else:
+                pass
+            raise
+
+    def encode_waveforms(self, waveforms: list[torch.Tensor]) -> list[torch.Tensor]:
+        if self.graph_execution_state.is_abandoned:
+            raise RuntimeError("Perception CUDA execution was abandoned")
+        else:
+            pass
         if len(waveforms) != self.batch_size:
             raise ValueError("waveform count must match runner batch_size")
         else:

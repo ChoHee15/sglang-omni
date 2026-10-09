@@ -27,8 +27,8 @@ from sglang_omni.models.nemotron_voicechat.payload_types import (
     OUTPUT_SAMPLE_RATE,
     NemotronVoiceChatState,
 )
+from sglang_omni.models.nemotron_voicechat.perception_encoder import PerceptionEncoder
 from sglang_omni.models.nemotron_voicechat.perception_scheduler import (
-    PerceptionEncoder,
     PerceptionScheduler,
 )
 from sglang_omni.models.weight_loader import (
@@ -96,6 +96,7 @@ def create_perception_executor(
     gpu_id: int | None = None,
     enable_cuda_graph: bool = True,
     max_batch_size: int | None = None,
+    max_cached_batch_runners: int | None = None,
     max_batch_wait_ms: float | None = None,
     max_batch_frames: int | None = None,
     max_padding_ratio: float | None = None,
@@ -103,6 +104,11 @@ def create_perception_executor(
     defaults = default_perception_factory_args()
     max_batch_size = (
         defaults.max_batch_size if max_batch_size is None else max_batch_size
+    )
+    max_cached_batch_runners = (
+        defaults.max_cached_batch_runners
+        if max_cached_batch_runners is None
+        else max_cached_batch_runners
     )
     max_batch_wait_ms = (
         defaults.max_batch_wait_ms if max_batch_wait_ms is None else max_batch_wait_ms
@@ -115,6 +121,7 @@ def create_perception_executor(
     )
     for name, value in (
         ("max_batch_size", max_batch_size),
+        ("max_cached_batch_runners", max_cached_batch_runners),
         ("max_batch_frames", max_batch_frames),
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -160,7 +167,9 @@ def create_perception_executor(
         GraphPerception(module) if enable_cuda_graph else StreamingPerception(module)
     )
     return PerceptionScheduler(
-        PerceptionEncoder(module, perception_stream, enable_cuda_graph),
+        PerceptionEncoder(
+            module, perception_stream, enable_cuda_graph, max_cached_batch_runners
+        ),
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
         max_batch_frames=max_batch_frames,
